@@ -1,0 +1,5 @@
+netbox2dns
+netbox2dns.sh
+*.pem
+*.key
+*.crt
