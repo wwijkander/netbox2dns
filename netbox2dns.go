@@ -366,7 +366,7 @@ func main() {
 	transport := &http.Transport{TLSClientConfig: config}
 	client = &http.Client{Transport: transport}
 
-	for _, v := range [7]*string{pdnsSocket, tlsCert, netboxURL, netboxToken, dnsZone, soaContact, zoneServers} {
+	for _, v := range []*string{pdnsSocket, tlsCert, tlsKey, netboxURL, netboxToken, dnsZone, soaContact, zoneServers} {
 		if len(*v) == 0 {
 			log.Fatalln("ERROR: missing flag")
 		}

@@ -18,7 +18,7 @@ PowerDNS backend for exposing NetBox hostnames with their management IPs as DNS 
 
 `--tlskey` Path to the key for above webhook certificate
 
-`--pdnssocket` Path to a socket where PowerDNS is set up to talk with us.
+`--pdnssocket` Path to a socket where PowerDNS is set up to talk with us, e.g. /opt/netbox2dns/netbox2dns.socket
 
 ## example PowerDNS configuration
 ```
