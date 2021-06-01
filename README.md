@@ -1,5 +1,29 @@
 # netbox2dns
-PowerDNS backend for exposing NetBox hostnames with their management IPs as DNS records
+(Hacky) PowerDNS backend for exposing NetBox hostnames with their management IPv4/IPv6s as DNS records, using the NetBox API.
+
+Will probably break if you have a larger installation.
+
+## Example PowerDNS configuration
+```
+setgid=pdns
+setuid=pdns
+loglevel=7
+launch=remote
+remote-connection-string=unix:path=/opt/netbox2dns/netbox2dns.socket
+```
+
+## NetBox configuration
+* Go to the Netbox admin area
+* Add read only token in Home › Users › Tokens
+* Add a POST webhook in Home › Extras › Webhooks
+  * (suggested) Content types: DCIM › device and Virtualization › virtual machine
+  * Events: create, update and delete
+  * URL: where netbox2dns is running on port 8053 using HTTPS and endpoint /v0/netboxHook, e.g. https://netbox-ns.example.com:8053/v0/netboxHook
+  * HTTP method: POST
+  * HTTP content type: application/json
+  * Secret: set to the same as the API token you generated above
+  * Enable SSL verification: on(specify your own trusted CA if needed)
+* Test things out by starting netbox2dns with flags below set and and the webhook by adding a host with management IP while running
 
 ## Configuration flags
 `--netboxtoken` API Token for NetBox, also need to be set as HMAC secret
@@ -19,12 +43,3 @@ PowerDNS backend for exposing NetBox hostnames with their management IPs as DNS 
 `--tlskey` Path to the key for above webhook certificate
 
 `--pdnssocket` Path to a socket where PowerDNS is set up to talk with us, e.g. /opt/netbox2dns/netbox2dns.socket
-
-## example PowerDNS configuration
-```
-setgid=pdns
-setuid=pdns
-loglevel=7
-launch=remote
-remote-connection-string=unix:path=/opt/netbox2dns/netbox2dns.socket
-```
