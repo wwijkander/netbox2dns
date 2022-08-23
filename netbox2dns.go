@@ -309,9 +309,22 @@ func handleSocketQuery(content io.Reader) (string, error) {
 	//case "list":
 	// TODO dnssec
 	//case "getBeforeAndAfterNamesAbsolute":
-	//case "getAllDomainMetadata":
-	case "getDomainMetadata":
-		return `{"result":false}`, nil
+
+	case "getAllDomainMetadata":
+		// "You must always return something, if there are no values, you shall return empty set."
+		unmarshalledReply := PowerDNSResponse{
+			Result: []PowerDNSResult{},
+		}
+
+		marshalledReply, err := json.Marshal(&unmarshalledReply)
+		if err != nil {
+			panic(err)
+		}
+
+		return string(marshalledReply), nil
+
+	//case "getDomainMetadata":
+	//	return `{"result":false}`, nil
 	//case "setDomainMetadata":
 	//case "getDomainKeys":
 	//case "addDomainKey":
