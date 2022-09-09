@@ -365,13 +365,14 @@ func main() {
 	rootCAs := x509.NewCertPool()
 	if len(*trustedCA) == 0 {
 		rootCAs, _ = x509.SystemCertPool()
-	}
-	certs, err := ioutil.ReadFile(*trustedCA)
-	if err != nil {
-		log.Fatalln("ERROR: could not read CA file")
-	}
-	if ok := rootCAs.AppendCertsFromPEM(certs); !ok {
-		log.Fatalln("ERROR: could not parse CA bundle")
+	} else {
+		certs, err := ioutil.ReadFile(*trustedCA)
+		if err != nil {
+			log.Fatalln("ERROR: could not read CA file")
+		}
+		if ok := rootCAs.AppendCertsFromPEM(certs); !ok {
+			log.Fatalln("ERROR: could not parse CA bundle")
+		}
 	}
 	config := &tls.Config{
 		RootCAs: rootCAs,
