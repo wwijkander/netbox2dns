@@ -209,7 +209,7 @@ func handleSocketQuery(content io.Reader) (string, error) {
 
 	case "lookup":
 		qname := strings.TrimSuffix(query.Parameters.Qname, "."+*dnsZone+".")
-		log.Println("serving qtype " + query.Parameters.Qtype + " for qname " + query.Parameters.Qname + " to DNS client " + query.Parameters.Remote)
+		//log.Println("serving qtype " + query.Parameters.Qtype + " for qname " + query.Parameters.Qname + " to DNS client " + query.Parameters.Remote)
 
 		v4IP := replyMapv4[strings.ToLower(qname)]
 		v6IP := replyMapv6[strings.ToLower(qname)]
@@ -352,7 +352,7 @@ func handleSocketConnection(connection net.Conn) {
 			continue
 		}
 		io.WriteString(connection, socketOutput)
-		log.Println("DEBUG: wrote to socket: " + socketOutput)
+		//log.Println("DEBUG: wrote to socket: " + socketOutput)
 	}
 	if err := scanner.Err(); err != nil {
 		panic(err)
