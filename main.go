@@ -100,10 +100,6 @@ func unmarshalNetboxHosts(marshalledData NetboxHost) {
 	case nil:
 		//replyMapv4[netboxHostname] = ""
 	default:
-		if len(replyMapv4[netboxHostname]) > 0 {
-			log.Println("BUG: " + netboxHostname + " already has an IPv4 record, skipping!!!")
-			return
-		}
 		primaryIPv4 := strings.Split(marshalledData.PrimaryIP4.(map[string]interface{})["address"].(string), "/")[0]
 		replyMapv4[netboxHostname] = primaryIPv4
 	}
@@ -112,10 +108,6 @@ func unmarshalNetboxHosts(marshalledData NetboxHost) {
 	case nil:
 		//replyMapv6[netboxHostname] = ""
 	default:
-		if len(replyMapv6[netboxHostname]) > 0 {
-			log.Println("BUG: " + netboxHostname + " already has an IPv6 record, skipping!!!")
-			return
-		}
 		primaryIPv6 := strings.Split(marshalledData.PrimaryIP6.(map[string]interface{})["address"].(string), "/")[0]
 		replyMapv6[netboxHostname] = primaryIPv6
 	}
