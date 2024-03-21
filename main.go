@@ -3,6 +3,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha512"
 	"crypto/tls"
@@ -16,9 +17,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/exp/slices"
 )
 
 var (
@@ -29,20 +33,25 @@ var (
 	tlsKey      = flag.String("tlskey", "", "Path to a file with a TLS key for the webhook HTTPS listener")
 	netboxURL   = flag.String("netboxurl", "", "Base URL where Netbox lives")
 	netboxToken = flag.String("netboxtoken", "", "Netbox token")
-	dnsZone     = flag.String("dnszone", "", "Zone we are answering questions for")
+	dnsZone     = flag.String("dnszone", "", "Comma separated list of zones we are answering questions for")
 	soaContact  = flag.String("soacontact", "", "Contact for SOA record, format 'user.example.com'")
-	// TODO make this a comma separated list
-	zoneServers = flag.String("zoneservers", "", "single(for now) FQDN that acts as DNS auth master for the zone")
+	zoneServers = flag.String("zoneservers", "", "Comma separated list of what NS records should be set to")
+
+	debug = flag.Bool("debug", false, "debug?")
+
+	dnsZoneSlice     []string
+	zoneServersSlice []string
 
 	client = &http.Client{}
 
 	paginationOffset = 0
 
-	replyMapv4 = make(map[string]string)
-	replyMapv6 = make(map[string]string)
+	replyMapv4 = make(map[string]map[string]string)
+	replyMapv6 = make(map[string]map[string]string)
 
 	hostname, _    = os.Hostname()
 	lastHostUpdate = time.Now().Unix()
+	reflectRegion  string
 )
 
 type PowerDNSQuery struct {
@@ -70,23 +79,24 @@ type PowerDNSResult struct {
 }
 
 type InitNetboxReply struct {
-	Count    int          `json:"count"`
-	Next     interface{}  `json:"next"`
-	Previous string       `json:"previous"`
-	Results  []NetboxHost `json:"results"`
+	Count    int            `json:"count"`
+	Next     interface{}    `json:"next"`
+	Previous string         `json:"previous"`
+	Results  []NetboxResult `json:"results"`
 }
 type UpdateNetboxHook struct {
-	Event     string     `json:"event"`
-	Timestamp string     `json:"timestamp"`
-	Model     string     `json:"model"`
-	Username  string     `json:"username"`
-	RequestId string     `json:"request_id"`
-	Data      NetboxHost `json:"data"`
+	Event     string       `json:"event"`
+	Timestamp string       `json:"timestamp"`
+	Model     string       `json:"model"`
+	Username  string       `json:"username"`
+	RequestId string       `json:"request_id"`
+	Data      NetboxResult `json:"data"`
 }
 
-type NetboxHost struct {
+type NetboxResult struct {
 	ID         int         `json:"id"`
 	Name       string      `json:"name"`
+	Slug       interface{} `json:"slug"`
 	PrimaryIP  interface{} `json:"primary_ip"`
 	PrimaryIP4 interface{} `json:"primary_ip4"`
 	PrimaryIP6 interface{} `json:"primary_ip6"`
@@ -94,14 +104,40 @@ type NetboxHost struct {
 	//LastUpdated time.Time `json:"last_updated"`
 }
 
-func unmarshalNetboxHosts(marshalledData NetboxHost) {
+// ordering matters
+type RegionLookupResult struct {
+	Errors []RegionLookupResultErrors `json:"errors"`
+	Data   RegionLookupResultData     `json:"data"`
+}
+
+type RegionLookupResultErrors struct {
+	Message string `json:"message"`
+}
+
+type RegionLookupResultData struct {
+	DeviceList []RegionLookupResultDeviceList `json:"device_list"`
+}
+type RegionLookupResultDeviceList struct {
+	Site RegionLookupResultSite `json:"site"`
+}
+
+type RegionLookupResultSite struct {
+	Region any `json:"region"`
+}
+
+type RegionLookupResultRegion struct {
+	Parent any    `json:"parent"`
+	Slug   string `json:"slug"`
+}
+
+func unmarshalNetboxHosts(marshalledData NetboxResult, region string) {
 	netboxHostname := strings.ToLower(marshalledData.Name)
 	switch marshalledData.PrimaryIP4.(type) {
 	case nil:
 		//replyMapv4[netboxHostname] = ""
 	default:
 		primaryIPv4 := strings.Split(marshalledData.PrimaryIP4.(map[string]interface{})["address"].(string), "/")[0]
-		replyMapv4[netboxHostname] = primaryIPv4
+		replyMapv4[region][netboxHostname] = primaryIPv4
 	}
 
 	switch marshalledData.PrimaryIP6.(type) {
@@ -109,12 +145,12 @@ func unmarshalNetboxHosts(marshalledData NetboxHost) {
 		//replyMapv6[netboxHostname] = ""
 	default:
 		primaryIPv6 := strings.Split(marshalledData.PrimaryIP6.(map[string]interface{})["address"].(string), "/")[0]
-		replyMapv6[netboxHostname] = primaryIPv6
+		replyMapv6[region][netboxHostname] = primaryIPv6
 	}
 }
 
-func initNetboxHosts(endpoint string) {
-	netboxRequestURL := *netboxURL + endpoint + "?limit=50&offset=" + strconv.Itoa(paginationOffset)
+func initNetboxHosts(endpoint string, region string) {
+	netboxRequestURL := *netboxURL + endpoint + "&has_primary_ip=True&limit=50&offset=" + strconv.Itoa(paginationOffset)
 	log.Println("Initialize Netbox Inventory from URL " + netboxRequestURL)
 	req, err := http.NewRequest("GET", netboxRequestURL, nil)
 	if err != nil {
@@ -137,15 +173,155 @@ func initNetboxHosts(endpoint string) {
 		panic(err)
 	}
 	for _, v := range reply.Results {
-		unmarshalNetboxHosts(v)
+		unmarshalNetboxHosts(v, region)
 	}
 
 	if reply.Next != nil {
 		paginationOffset += 50
-		initNetboxHosts(endpoint)
+		initNetboxHosts(endpoint, region)
 	}
 
 	return
+}
+
+func initNetboxRegions() []string {
+	netboxRequestURL := *netboxURL + "/api/dcim/regions/?parent=null&limit=50&offset=" + strconv.Itoa(paginationOffset)
+	log.Println("Initialize Netbox regions from URL " + netboxRequestURL)
+	req, err := http.NewRequest("GET", netboxRequestURL, nil)
+	if err != nil {
+		panic(err)
+	}
+	req.Header.Set("Authorization", "Token "+*netboxToken)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		panic(err)
+	}
+	defer resp.Body.Close()
+
+	decoded := json.NewDecoder(resp.Body)
+
+	var reply InitNetboxReply
+
+	err = decoded.Decode(&reply)
+	if err != nil {
+		panic(err)
+	}
+
+	var regions []string
+	for _, v := range reply.Results {
+		regions = append(regions, v.Slug.(string))
+	}
+
+	if reply.Next != nil {
+		paginationOffset += 50
+		initNetboxRegions()
+	}
+
+	return regions
+}
+
+func readStruct(val reflect.Value) {
+	if val.Kind() == reflect.Ptr {
+		val = val.Elem()
+	}
+	for i := 0; i < val.NumField(); i++ {
+		//fmt.Println(val.Type().Field(i).Type.Kind())
+		f := val.Field(i)
+		switch f.Kind() {
+		case reflect.Struct:
+			readStruct(f)
+		case reflect.Slice:
+			if val.Type().Field(i).Name == "DeviceList" && f.Len() != 1 {
+				log.Println("Not the correct amount of records(1) received from GraphQL")
+				break
+			}
+			for j := 0; j < f.Len(); j++ {
+				readStruct(f.Index(j))
+			}
+		case reflect.Interface:
+			if f.IsNil() {
+				if val.Type().Field(i).Name == "Parent" {
+					reflectRegion = val.Field(i + 1).String()
+				}
+
+			} else {
+				//fmt.Println(reflect.TypeOf(f.Interface()).String())
+				regionStruct, _ := f.Interface().(RegionLookupResultRegion)
+				readStruct(reflect.ValueOf(regionStruct))
+			}
+		case reflect.String:
+			if val.Type().Field(i).Name == "Message" {
+				log.Printf("Error received from GraphQL: %s", val.Field(i).String())
+			}
+		}
+	}
+}
+
+func hostnameToRegion(hostname string) string {
+	netboxRequestURL := *netboxURL + "/graphql/"
+	log.Println("translating hostname to region using GraphQL" + netboxRequestURL)
+
+	graphQLQuery := []byte(`
+	{
+	"query":
+	 query {
+	  device_list(name: \"` + hostname + `\") {
+	    name
+	    site {
+	      region {
+		slug
+		level
+		parent {
+		  slug
+		  level
+		  parent {
+		    slug
+		    level
+		    parent {
+		      slug
+		      level
+		      parent {
+			slug
+			level
+			parent {
+			  slug
+			  level
+			}
+		      }
+		    }
+		  }
+		}
+	      }
+	    }
+	  }
+	}
+	}`)
+
+	req, err := http.NewRequest("POST", netboxRequestURL, bytes.NewBuffer(graphQLQuery))
+	if err != nil {
+		panic(err)
+	}
+	req.Header.Set("Authorization", "Token "+*netboxToken)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		panic(err)
+	}
+	defer resp.Body.Close()
+
+	decoded := json.NewDecoder(resp.Body)
+
+	var reply RegionLookupResult
+
+	err = decoded.Decode(&reply)
+	if err != nil {
+		panic(err)
+	}
+
+	readStruct(reflect.ValueOf(reply))
+
+	return reflectRegion
 }
 
 func checkMAC(payload []byte, receivedMACStr string) bool {
@@ -177,7 +353,8 @@ func hookHandler(w http.ResponseWriter, req *http.Request) {
 		if err != nil {
 			panic(err)
 		}
-		unmarshalNetboxHosts(webhook.Data)
+		unmarshalNetboxHosts(webhook.Data, hostnameToRegion(webhook.Data.Name))
+		reflectRegion = ""
 		lastHostUpdate = time.Now().Unix()
 		log.Println("Processed webhook from Netbox")
 	default:
@@ -200,11 +377,11 @@ func handleSocketQuery(content io.Reader) (string, error) {
 		return `{"result":true}`, nil
 
 	case "lookup":
-		qname := strings.TrimSuffix(query.Parameters.Qname, "."+*dnsZone+".")
-		//log.Println("serving qtype " + query.Parameters.Qtype + " for qname " + query.Parameters.Qname + " to DNS client " + query.Parameters.Remote)
+		qname, domainPart, _ := strings.Cut(strings.ToLower(query.Parameters.Qname), ".")
+		region, _, _ := strings.Cut(domainPart, ".")
 
-		v4IP := replyMapv4[strings.ToLower(qname)]
-		v6IP := replyMapv6[strings.ToLower(qname)]
+		v4IP := replyMapv4[region][qname]
+		v6IP := replyMapv6[region][qname]
 
 		a := PowerDNSResult{
 			Qtype:   "A",
@@ -221,17 +398,22 @@ func handleSocketQuery(content io.Reader) (string, error) {
 		}
 
 		soa := PowerDNSResult{
-			Qtype:   "SOA",
-			Qname:   *dnsZone,
+			Qtype: "SOA",
+			Qname: query.Parameters.Qname,
+			//Qname:   *dnsZone,
 			Content: *zoneServers + ". " + *soaContact + ". " + strconv.FormatInt(lastHostUpdate, 10) + " 14400 3600 2419000 43200",
 			TTL:     172800,
 		}
 
-		ns := PowerDNSResult{
-			Qtype:   "NS",
-			Qname:   *dnsZone,
-			Content: *zoneServers + ".",
-			TTL:     172800,
+		var ns []PowerDNSResult
+		for _, v := range zoneServersSlice {
+			ns = append(ns, PowerDNSResult{
+				Qtype: "NS",
+				Qname: query.Parameters.Qname,
+				//Qname:   *dnsZone,
+				Content: v + ".",
+				TTL:     172800,
+			})
 		}
 
 		unmarshalledReply := PowerDNSResponse{
@@ -254,10 +436,12 @@ func handleSocketQuery(content io.Reader) (string, error) {
 			}
 		case "ANY":
 			switch {
-			case query.Parameters.Qname == *dnsZone+".":
+			case slices.Contains(dnsZoneSlice, query.Parameters.Qname):
 				// we arbitrarily decide that the zone apex doesn't get to have A/AAAA
+
+				ns = append(ns, soa)
 				unmarshalledReply = PowerDNSResponse{
-					Result: []PowerDNSResult{soa, ns},
+					Result: ns,
 				}
 			case len(v4IP) > 0:
 				switch {
@@ -276,15 +460,15 @@ func handleSocketQuery(content io.Reader) (string, error) {
 				}
 			}
 		case "SOA":
-			if query.Parameters.Qname == *dnsZone+"." {
+			if slices.Contains(dnsZoneSlice, query.Parameters.Qname) {
 				unmarshalledReply = PowerDNSResponse{
 					Result: []PowerDNSResult{soa},
 				}
 			}
 		case "NS":
-			if query.Parameters.Qname == *dnsZone+"." {
+			if slices.Contains(dnsZoneSlice, query.Parameters.Qname) {
 				unmarshalledReply = PowerDNSResponse{
-					Result: []PowerDNSResult{ns},
+					Result: ns,
 				}
 			}
 		default:
@@ -294,6 +478,9 @@ func handleSocketQuery(content io.Reader) (string, error) {
 		marshalledReply, err := json.Marshal(&unmarshalledReply)
 		if err != nil {
 			panic(err)
+		}
+		if *debug {
+			log.Printf("%s", string(marshalledReply))
 		}
 		return string(marshalledReply), nil
 
@@ -377,15 +564,24 @@ func main() {
 			log.Fatalln("ERROR: missing flag")
 		}
 	}
+	dnsZoneSlice = strings.Split(*dnsZone, ",")
+	zoneServersSlice = strings.Split(*zoneServers, ",")
 
 	// fetch initial inventory of hostnames and IPs
 	startTime := time.Now()
-	for _, v := range []string{"/api/dcim/devices/", "/api/virtualization/virtual-machines/"} {
-		initNetboxHosts(v)
-		log.Println("Initialized records for " + v)
+	for _, v := range initNetboxRegions() {
+		replyMapv4[v] = make(map[string]string)
+		replyMapv6[v] = make(map[string]string)
+		initNetboxHosts("/api/dcim/devices/?region="+v, v)
+		log.Println("Initialized records for region " + v)
 		paginationOffset = 0
 	}
-	//initNetboxHosts([]string{"/api/dcim/devices/", "/api/virtualization/virtual-machines/"})
+	replyMapv4["vm"] = make(map[string]string)
+	replyMapv6["vm"] = make(map[string]string)
+	initNetboxHosts("/api/virtualization/virtual-machines/?", "vm")
+	log.Println("Initialized records for VMs")
+	paginationOffset = 0
+
 	log.Printf("Done with initialization, took %s\n", time.Since(startTime))
 	lastHostUpdate = time.Now().Unix()
 
