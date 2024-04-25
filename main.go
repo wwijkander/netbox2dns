@@ -3,7 +3,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"crypto/hmac"
 	"crypto/sha512"
 	"crypto/tls"
@@ -17,7 +16,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -37,12 +35,15 @@ var (
 	soaContact  = flag.String("soacontact", "", "Contact for SOA record, format 'user.example.com'")
 	zoneServers = flag.String("zoneservers", "", "Comma separated list of what NS records should be set to")
 
-	debug = flag.Bool("debug", false, "debug?")
+	debug         = flag.Bool("debug", false, "debug?")
+	debugSkipSync = flag.Bool("debug-skip-sync", false, "debug: skip initial sync?")
 
 	dnsZoneSlice     []string
 	zoneServersSlice []string
 
 	client = &http.Client{}
+
+	err error
 
 	paginationOffset = 0
 
@@ -84,6 +85,7 @@ type InitNetboxReply struct {
 	Previous string         `json:"previous"`
 	Results  []NetboxResult `json:"results"`
 }
+
 type UpdateNetboxHook struct {
 	Event     string       `json:"event"`
 	Timestamp string       `json:"timestamp"`
@@ -94,40 +96,19 @@ type UpdateNetboxHook struct {
 }
 
 type NetboxResult struct {
-	ID         int         `json:"id"`
-	Name       string      `json:"name"`
-	Slug       interface{} `json:"slug"`
-	PrimaryIP  interface{} `json:"primary_ip"`
-	PrimaryIP4 interface{} `json:"primary_ip4"`
-	PrimaryIP6 interface{} `json:"primary_ip6"`
-	Created    string      `json:"created"`
+	ID         int           `json:"id"`
+	Url        string        `json:"url"`
+	Name       string        `json:"name"`
+	Site       *NetboxResult `json:"site"`
+	Region     interface{}   `json:"region"`
+	Parent     *NetboxResult `json:"parent"`
+	Slug       string        `json:"slug"`
+	PrimaryIP4 interface{}   `json:"primary_ip4"`
+	PrimaryIP6 interface{}   `json:"primary_ip6"`
+	Created    string        `json:"created"`
+	Depth      int           `json:"_depth"`
+	//	PrimaryIP  interface{}  `json:"primary_ip"`
 	//LastUpdated time.Time `json:"last_updated"`
-}
-
-// ordering matters
-type RegionLookupResult struct {
-	Errors []RegionLookupResultErrors `json:"errors"`
-	Data   RegionLookupResultData     `json:"data"`
-}
-
-type RegionLookupResultErrors struct {
-	Message string `json:"message"`
-}
-
-type RegionLookupResultData struct {
-	DeviceList []RegionLookupResultDeviceList `json:"device_list"`
-}
-type RegionLookupResultDeviceList struct {
-	Site RegionLookupResultSite `json:"site"`
-}
-
-type RegionLookupResultSite struct {
-	Region any `json:"region"`
-}
-
-type RegionLookupResultRegion struct {
-	Parent any    `json:"parent"`
-	Slug   string `json:"slug"`
 }
 
 func unmarshalNetboxHosts(marshalledData NetboxResult, region string) {
@@ -210,7 +191,7 @@ func initNetboxRegions() []string {
 
 	var regions []string
 	for _, v := range reply.Results {
-		regions = append(regions, v.Slug.(string))
+		regions = append(regions, v.Slug)
 	}
 
 	if reply.Next != nil {
@@ -221,84 +202,10 @@ func initNetboxRegions() []string {
 	return regions
 }
 
-func readStruct(val reflect.Value) {
-	if val.Kind() == reflect.Ptr {
-		val = val.Elem()
-	}
-	for i := 0; i < val.NumField(); i++ {
-		//fmt.Println(val.Type().Field(i).Type.Kind())
-		f := val.Field(i)
-		switch f.Kind() {
-		case reflect.Struct:
-			readStruct(f)
-		case reflect.Slice:
-			if val.Type().Field(i).Name == "DeviceList" && f.Len() != 1 {
-				log.Println("Not the correct amount of records(1) received from GraphQL")
-				break
-			}
-			for j := 0; j < f.Len(); j++ {
-				readStruct(f.Index(j))
-			}
-		case reflect.Interface:
-			if f.IsNil() {
-				if val.Type().Field(i).Name == "Parent" {
-					reflectRegion = val.Field(i + 1).String()
-				}
+func netboxRequest(url string) NetboxResult {
+	netboxRequestURL := *netboxURL + url
 
-			} else {
-				//fmt.Println(reflect.TypeOf(f.Interface()).String())
-				regionStruct, _ := f.Interface().(RegionLookupResultRegion)
-				readStruct(reflect.ValueOf(regionStruct))
-			}
-		case reflect.String:
-			if val.Type().Field(i).Name == "Message" {
-				log.Printf("Error received from GraphQL: %s", val.Field(i).String())
-			}
-		}
-	}
-}
-
-func hostnameToRegion(hostname string) string {
-	netboxRequestURL := *netboxURL + "/graphql/"
-	log.Println("translating hostname to region using GraphQL" + netboxRequestURL)
-
-	graphQLQuery := []byte(`
-	{
-	"query":
-	 query {
-	  device_list(name: \"` + hostname + `\") {
-	    name
-	    site {
-	      region {
-		slug
-		level
-		parent {
-		  slug
-		  level
-		  parent {
-		    slug
-		    level
-		    parent {
-		      slug
-		      level
-		      parent {
-			slug
-			level
-			parent {
-			  slug
-			  level
-			}
-		      }
-		    }
-		  }
-		}
-	      }
-	    }
-	  }
-	}
-	}`)
-
-	req, err := http.NewRequest("POST", netboxRequestURL, bytes.NewBuffer(graphQLQuery))
+	req, err := http.NewRequest("GET", netboxRequestURL, nil)
 	if err != nil {
 		panic(err)
 	}
@@ -312,16 +219,40 @@ func hostnameToRegion(hostname string) string {
 
 	decoded := json.NewDecoder(resp.Body)
 
-	var reply RegionLookupResult
+	var reply NetboxResult
 
 	err = decoded.Decode(&reply)
 	if err != nil {
 		panic(err)
 	}
 
-	readStruct(reflect.ValueOf(reply))
+	return reply
+}
 
-	return reflectRegion
+func siteToRegion(url string) string {
+
+	region := ""
+
+	reply := netboxRequest(url)
+
+	i := reply.Region
+
+	switch i.(type) {
+	case nil:
+	case map[string]interface{}:
+		region = i.(map[string]interface{})["slug"].(string)
+		regionID := int(i.(map[string]interface{})["id"].(float64))
+		for depth := int(i.(map[string]interface{})["_depth"].(float64)); depth > 0; {
+			url = "/api/dcim/regions/" + strconv.Itoa(regionID) + "/"
+			reply := netboxRequest(url)
+
+			region = reply.Parent.Slug
+			regionID = reply.Parent.ID
+			depth = reply.Parent.Depth
+		}
+	}
+
+	return region
 }
 
 func checkMAC(payload []byte, receivedMACStr string) bool {
@@ -353,7 +284,8 @@ func hookHandler(w http.ResponseWriter, req *http.Request) {
 		if err != nil {
 			panic(err)
 		}
-		unmarshalNetboxHosts(webhook.Data, hostnameToRegion(webhook.Data.Name))
+
+		unmarshalNetboxHosts(webhook.Data, siteToRegion(webhook.Data.Site.Url))
 		reflectRegion = ""
 		lastHostUpdate = time.Now().Unix()
 		log.Println("Processed webhook from Netbox")
@@ -572,14 +504,22 @@ func main() {
 	for _, v := range initNetboxRegions() {
 		replyMapv4[v] = make(map[string]string)
 		replyMapv6[v] = make(map[string]string)
-		initNetboxHosts("/api/dcim/devices/?region="+v, v)
-		log.Println("Initialized records for region " + v)
+		if *debugSkipSync {
+			log.Println("Skipped initialization for region " + v)
+		} else {
+			initNetboxHosts("/api/dcim/devices/?region="+v, v)
+			log.Println("Initialized records for region " + v)
+		}
 		paginationOffset = 0
 	}
 	replyMapv4["vm"] = make(map[string]string)
 	replyMapv6["vm"] = make(map[string]string)
-	initNetboxHosts("/api/virtualization/virtual-machines/?", "vm")
-	log.Println("Initialized records for VMs")
+	if *debugSkipSync {
+		log.Println("Skipped initialization for VMs")
+	} else {
+		initNetboxHosts("/api/virtualization/virtual-machines/?", "vm")
+		log.Println("Initialized records for VMs")
+	}
 	paginationOffset = 0
 
 	log.Printf("Done with initialization, took %s\n", time.Since(startTime))
