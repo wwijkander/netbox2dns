@@ -52,7 +52,6 @@ var (
 
 	hostname, _    = os.Hostname()
 	lastHostUpdate = time.Now().Unix()
-	reflectRegion  string
 )
 
 type PowerDNSQuery struct {
@@ -112,6 +111,10 @@ type NetboxResult struct {
 }
 
 func unmarshalNetboxHosts(marshalledData NetboxResult, region string) {
+	if region == "" {
+		log.Println("unmarshalNetboxHosts() dropping record with empty region")
+		return
+	}
 	netboxHostname := strings.ToLower(marshalledData.Name)
 	switch marshalledData.PrimaryIP4.(type) {
 	case nil:
@@ -239,6 +242,8 @@ func siteToRegion(url string) string {
 
 	switch i.(type) {
 	case nil:
+
+	// TODO: fix below
 	case map[string]interface{}:
 		region = i.(map[string]interface{})["slug"].(string)
 		regionID := int(i.(map[string]interface{})["id"].(float64))
@@ -282,13 +287,26 @@ func hookHandler(w http.ResponseWriter, req *http.Request) {
 
 		err := json.Unmarshal(hookBody, &webhook)
 		if err != nil {
-			panic(err)
-		}
+			log.Println("Dropping webhook update with weird JSON: \n" + string(hookBody))
+		} else {
 
-		unmarshalNetboxHosts(webhook.Data, siteToRegion(webhook.Data.Site.Url))
-		reflectRegion = ""
-		lastHostUpdate = time.Now().Unix()
-		log.Println("Processed webhook from Netbox")
+			switch webhook.Model {
+			case "device":
+				unmarshalNetboxHosts(webhook.Data, siteToRegion(webhook.Data.Site.Url))
+				log.Println("Processed device webhook update")
+			case "virtualmachine":
+				unmarshalNetboxHosts(webhook.Data, "vm")
+				log.Println("Processed VM webhook update")
+			case "region":
+				if webhook.Data.Depth == 0 {
+					log.Println("Region layout in netbox may have changed. Consider revising DNS zone delegation and restarting this program with updated arguments!")
+				}
+			default:
+				log.Println("Dropping webhook update with unknown model, you should probably check your netbox webhook settings: \n" + string(hookBody))
+			}
+
+			lastHostUpdate = time.Now().Unix()
+		}
 	default:
 		log.Println("Dropping webhook update with bad HMAC!")
 	}
