@@ -351,7 +351,7 @@ func handleSocketQuery(content io.Reader) (string, error) {
 			Qtype: "SOA",
 			Qname: query.Parameters.Qname,
 			//Qname:   *dnsZone,
-			Content: *zoneServers + ". " + *soaContact + ". " + strconv.FormatInt(lastHostUpdate, 10) + " 14400 3600 2419000 43200",
+			Content: zoneServersSlice[0] + ". " + *soaContact + ". " + strconv.FormatInt(lastHostUpdate, 10) + " 14400 3600 2419000 43200",
 			TTL:     172800,
 		}
 
