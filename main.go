@@ -35,8 +35,9 @@ var (
 	soaContact  = flag.String("soacontact", "", "Contact for SOA record, format 'user.example.com'")
 	zoneServers = flag.String("zoneservers", "", "Comma separated list of what NS records should be set to")
 
-	debug         = flag.Bool("debug", false, "debug?")
-	debugSkipSync = flag.Bool("debug-skip-sync", false, "debug: skip initial sync?")
+	debug            = flag.Bool("debug", false, "debug?")
+	debugSkipSync    = flag.Bool("debug-skip-sync", false, "debug: skip initial sync?")
+	debugSkipWebhook = flag.Bool("debug-skip-webhook", false, "debug: skip starting webhook?")
 
 	dnsZoneSlice     []string
 	zoneServersSlice []string
@@ -68,7 +69,8 @@ type PowerDNSQuery struct {
 }
 
 type PowerDNSResponse struct {
-	Result []PowerDNSResult `json:"result"`
+	//Result []PowerDNSResult `json:"result"`
+	Result interface{} `json:"result"`
 }
 
 type PowerDNSResult struct {
@@ -76,6 +78,16 @@ type PowerDNSResult struct {
 	Qname   string `json:"qname"`
 	Content string `json:"content"`
 	TTL     int    `json:"ttl"`
+}
+
+type PowerDNSResultGetAllDomains struct {
+	ID             int      `json:"id"`
+	Zone           string   `json:"zone"`
+	Masters        []string `json:"masters"`
+	NotifiedSerial int      `json:"notified_serial"`
+	Serial         int      `json:"serial"`
+	LastCheck      int      `json:"last_check"`
+	Kind           string   `json:"kind"`
 }
 
 type InitNetboxReply struct {
@@ -316,18 +328,25 @@ func handleSocketQuery(content io.Reader) (string, error) {
 	decoded := json.NewDecoder(content)
 
 	var query PowerDNSQuery
+	var unmarshalledReply PowerDNSResponse
 
 	err := decoded.Decode(&query)
 	if err != nil {
 		return "", err
 	}
+
 	switch query.Method {
 	case "initialize":
 		log.Println("initializing socket connection to PowerDNS")
 		return `{"result":true}`, nil
 
 	case "lookup":
-		qname, domainPart, _ := strings.Cut(strings.ToLower(query.Parameters.Qname), ".")
+		cleanQuery, found := strings.CutSuffix(strings.ToLower(query.Parameters.Qname), ".")
+		if !found {
+			log.Printf("Non-compliant qname received on socket")
+			return `{"result":false}`, nil
+		}
+		qname, domainPart, _ := strings.Cut(cleanQuery, ".")
 		region, _, _ := strings.Cut(domainPart, ".")
 
 		v4IP := replyMapv4[region][qname]
@@ -335,21 +354,21 @@ func handleSocketQuery(content io.Reader) (string, error) {
 
 		a := PowerDNSResult{
 			Qtype:   "A",
-			Qname:   query.Parameters.Qname,
+			Qname:   cleanQuery,
 			Content: v4IP,
 			TTL:     3600,
 		}
 
 		aaaa := PowerDNSResult{
 			Qtype:   "AAAA",
-			Qname:   query.Parameters.Qname,
+			Qname:   cleanQuery,
 			Content: v6IP,
 			TTL:     3600,
 		}
 
 		soa := PowerDNSResult{
 			Qtype: "SOA",
-			Qname: query.Parameters.Qname,
+			Qname: cleanQuery,
 			//Qname:   *dnsZone,
 			Content: zoneServersSlice[0] + ". " + *soaContact + ". " + strconv.FormatInt(lastHostUpdate, 10) + " 14400 3600 2419000 43200",
 			TTL:     172800,
@@ -359,14 +378,15 @@ func handleSocketQuery(content io.Reader) (string, error) {
 		for _, v := range zoneServersSlice {
 			ns = append(ns, PowerDNSResult{
 				Qtype: "NS",
-				Qname: query.Parameters.Qname,
+				Qname: cleanQuery,
 				//Qname:   *dnsZone,
 				Content: v + ".",
 				TTL:     172800,
 			})
 		}
 
-		unmarshalledReply := PowerDNSResponse{
+		// default unfilled lookup reply
+		unmarshalledReply = PowerDNSResponse{
 			Result: []PowerDNSResult{},
 		}
 
@@ -386,7 +406,7 @@ func handleSocketQuery(content io.Reader) (string, error) {
 			}
 		case "ANY":
 			switch {
-			case slices.Contains(dnsZoneSlice, query.Parameters.Qname):
+			case slices.Contains(dnsZoneSlice, cleanQuery):
 				// we arbitrarily decide that the zone apex doesn't get to have A/AAAA
 
 				ns = append(ns, soa)
@@ -410,47 +430,66 @@ func handleSocketQuery(content io.Reader) (string, error) {
 				}
 			}
 		case "SOA":
-			if slices.Contains(dnsZoneSlice, query.Parameters.Qname) {
+			if slices.Contains(dnsZoneSlice, cleanQuery) {
 				unmarshalledReply = PowerDNSResponse{
 					Result: []PowerDNSResult{soa},
 				}
 			}
 		case "NS":
-			if slices.Contains(dnsZoneSlice, query.Parameters.Qname) {
+			if slices.Contains(dnsZoneSlice, cleanQuery) {
 				unmarshalledReply = PowerDNSResponse{
 					Result: ns,
 				}
 			}
-		default:
-			log.Println("unsupported qtype " + query.Parameters.Qtype)
-		}
+		case "TXT":
+			if qname == "netbox2dnsnetbox2dnsnetbox2dns" {
+				txt := PowerDNSResult{
+					Qtype:   "TXT",
+					Qname:   cleanQuery,
+					Content: "hello, txt",
+					TTL:     42,
+				}
 
-		marshalledReply, err := json.Marshal(&unmarshalledReply)
-		if err != nil {
-			panic(err)
+				unmarshalledReply = PowerDNSResponse{
+					Result: []PowerDNSResult{txt},
+				}
+			}
+		default:
+			log.Println("Ignoring unsupported qtype " + query.Parameters.Qtype)
+			return `{"result":false}`, nil
 		}
-		if *debug {
-			log.Printf("%s", string(marshalledReply))
-		}
-		return string(marshalledReply), nil
 
 	// TODO axfr
 	//case "list":
 	// TODO dnssec
 	//case "getBeforeAndAfterNamesAbsolute":
 
+	case "getAllDomains":
+		// PowerDNS zone cache support
+
+		var gad []PowerDNSResultGetAllDomains
+
+		for k, v := range dnsZoneSlice {
+			gad = append(gad, PowerDNSResultGetAllDomains{
+				ID:             k,
+				Zone:           v + ".",
+				Masters:        []string{},
+				NotifiedSerial: -1,
+				Serial:         0,
+				LastCheck:      0,
+				Kind:           "native",
+			})
+		}
+
+		unmarshalledReply = PowerDNSResponse{
+			Result: gad,
+		}
+
 	case "getAllDomainMetadata":
 		// "You must always return something, if there are no values, you shall return empty set."
-		unmarshalledReply := PowerDNSResponse{
+		unmarshalledReply = PowerDNSResponse{
 			Result: []PowerDNSResult{},
 		}
-
-		marshalledReply, err := json.Marshal(&unmarshalledReply)
-		if err != nil {
-			panic(err)
-		}
-
-		return string(marshalledReply), nil
 
 	//case "getDomainMetadata":
 	//	return `{"result":false}`, nil
@@ -464,9 +503,16 @@ func handleSocketQuery(content io.Reader) (string, error) {
 	//case "getDomainInfo":
 
 	default:
+		log.Println("Ignoring unsupported query method " + query.Method)
+		return `{"result":false}`, nil
 	}
-	log.Println("ignoring unknown query method " + query.Method + " from PowerDNS")
-	return `{"result":false}`, nil
+
+	marshalledReply, err := json.Marshal(&unmarshalledReply)
+	if err != nil {
+		panic(err)
+	}
+
+	return string(marshalledReply), nil
 }
 
 func handleSocketConnection(connection net.Conn) {
@@ -474,14 +520,22 @@ func handleSocketConnection(connection net.Conn) {
 	log.Printf("Lookup socket client connected [%s]", connection.RemoteAddr().Network())
 	scanner := bufio.NewScanner(connection)
 	for scanner.Scan() {
-		// TODO unfuck this
-		socketOutput, err := handleSocketQuery(strings.NewReader(scanner.Text()))
+		scanned := scanner.Text()
+
+		if *debug {
+			log.Println("DEBUG: read from socket: " + scanned)
+		}
+
+		socketOutput, err := handleSocketQuery(strings.NewReader(scanned))
 		if err != nil {
 			log.Println("error parsing JSON from socket: " + err.Error())
 			continue
 		}
 		io.WriteString(connection, socketOutput)
-		//log.Println("DEBUG: wrote to socket: " + socketOutput)
+
+		if *debug {
+			log.Println("DEBUG: wrote to socket: " + socketOutput)
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		panic(err)
@@ -509,7 +563,7 @@ func main() {
 	transport := &http.Transport{TLSClientConfig: config}
 	client = &http.Client{Transport: transport}
 
-	for _, v := range []*string{pdnsSocket, tlsCert, tlsKey, netboxURL, netboxToken, dnsZone, soaContact, zoneServers} {
+	for _, v := range []*string{pdnsSocket, netboxURL, netboxToken, dnsZone, soaContact, zoneServers} {
 		if len(*v) == 0 {
 			log.Fatalln("ERROR: missing flag")
 		}
@@ -540,18 +594,25 @@ func main() {
 	}
 	paginationOffset = 0
 
+	replyMapv6["debug"] = make(map[string]string)
+	replyMapv6["debug"]["debug"] = "dead::"
+
 	log.Printf("Done with initialization, took %s\n", time.Since(startTime))
 	lastHostUpdate = time.Now().Unix()
 
 	log.Println("starting with " + strconv.Itoa(len(replyMapv4)) + " A records")
 	log.Println("starting with " + strconv.Itoa(len(replyMapv6)) + " AAAA records")
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v0/netboxHook", hookHandler)
-	// handle webhook updates in a goroutine to not block main()
-	go func() {
-		log.Fatal("update webhook error: " + http.ListenAndServeTLS(":8053", *tlsCert, *tlsKey, mux).Error())
-	}()
+	if *debugSkipWebhook {
+		log.Println("Not starting webhook handler goroutine")
+	} else {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/v0/netboxHook", hookHandler)
+		// handle webhook updates in a goroutine to not block main()
+		go func() {
+			log.Fatal("update webhook error: " + http.ListenAndServeTLS(":8053", *tlsCert, *tlsKey, mux).Error())
+		}()
+	}
 
 	if err := os.RemoveAll(*pdnsSocket); err != nil {
 		log.Fatal(err)
