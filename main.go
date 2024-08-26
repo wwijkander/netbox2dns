@@ -31,7 +31,7 @@ var (
 	tlsKey      = flag.String("tlskey", "", "Path to a file with a TLS key for the webhook HTTPS listener")
 	netboxURL   = flag.String("netboxurl", "", "Base URL where Netbox lives")
 	netboxToken = flag.String("netboxtoken", "", "Netbox token")
-	dnsZone     = flag.String("dnszone", "", "Comma separated list of zones we are answering questions for")
+	baseDomain  = flag.String("basedomain", "", "our base domain")
 	soaContact  = flag.String("soacontact", "", "Contact for SOA record, format 'user.example.com'")
 	zoneServers = flag.String("zoneservers", "", "Comma separated list of what NS records should be set to")
 
@@ -50,6 +50,7 @@ var (
 
 	replyMapv4 = make(map[string]map[string]string)
 	replyMapv6 = make(map[string]map[string]string)
+	regionMap  = make(map[string]string)
 
 	hostname, _    = os.Hostname()
 	lastHostUpdate = time.Now().Unix()
@@ -128,6 +129,7 @@ func unmarshalNetboxHosts(marshalledData NetboxResult, region string) {
 		return
 	}
 	netboxHostname := strings.ToLower(marshalledData.Name)
+	regionMap[netboxHostname] = region
 	switch marshalledData.PrimaryIP4.(type) {
 	case nil:
 		//replyMapv4[netboxHostname] = ""
@@ -146,7 +148,7 @@ func unmarshalNetboxHosts(marshalledData NetboxResult, region string) {
 }
 
 func initNetboxHosts(endpoint string, region string) {
-	netboxRequestURL := *netboxURL + endpoint + "&has_primary_ip=True&limit=50&offset=" + strconv.Itoa(paginationOffset)
+	netboxRequestURL := *netboxURL + endpoint + "&has_primary_ip=True&limit=1000&offset=" + strconv.Itoa(paginationOffset)
 	log.Println("Initialize Netbox Inventory from URL " + netboxRequestURL)
 	req, err := http.NewRequest("GET", netboxRequestURL, nil)
 	if err != nil {
@@ -173,7 +175,7 @@ func initNetboxHosts(endpoint string, region string) {
 	}
 
 	if reply.Next != nil {
-		paginationOffset += 50
+		paginationOffset += 1000
 		initNetboxHosts(endpoint, region)
 	}
 
@@ -329,6 +331,7 @@ func handleSocketQuery(content io.Reader) (string, error) {
 
 	var query PowerDNSQuery
 	var unmarshalledReply PowerDNSResponse
+	powerDNSResult := []PowerDNSResult{}
 
 	err := decoded.Decode(&query)
 	if err != nil {
@@ -346,11 +349,17 @@ func handleSocketQuery(content io.Reader) (string, error) {
 			log.Printf("Non-compliant qname received on socket")
 			return `{"result":false}`, nil
 		}
+
 		qname, domainPart, _ := strings.Cut(cleanQuery, ".")
+
 		region, _, _ := strings.Cut(domainPart, ".")
 
 		v4IP := replyMapv4[region][qname]
 		v6IP := replyMapv6[region][qname]
+		var cnameRegion string
+		if *baseDomain == domainPart && len(regionMap[qname]) > 0 {
+			cnameRegion = qname + "." + regionMap[qname] + "." + *baseDomain + "."
+		}
 
 		a := PowerDNSResult{
 			Qtype:   "A",
@@ -363,6 +372,13 @@ func handleSocketQuery(content io.Reader) (string, error) {
 			Qtype:   "AAAA",
 			Qname:   cleanQuery,
 			Content: v6IP,
+			TTL:     3600,
+		}
+
+		cname := PowerDNSResult{
+			Qtype:   "CNAME",
+			Qname:   cleanQuery,
+			Content: cnameRegion,
 			TTL:     3600,
 		}
 
@@ -385,24 +401,18 @@ func handleSocketQuery(content io.Reader) (string, error) {
 			})
 		}
 
-		// default unfilled lookup reply
-		unmarshalledReply = PowerDNSResponse{
-			Result: []PowerDNSResult{},
-		}
-
-		// TODO this is ugly
 		switch query.Parameters.Qtype {
 		case "A":
 			if len(v4IP) > 0 {
-				unmarshalledReply = PowerDNSResponse{
-					Result: []PowerDNSResult{a},
-				}
+				powerDNSResult = append(powerDNSResult, a)
 			}
 		case "AAAA":
 			if len(v6IP) > 0 {
-				unmarshalledReply = PowerDNSResponse{
-					Result: []PowerDNSResult{aaaa},
-				}
+				powerDNSResult = append(powerDNSResult, aaaa)
+			}
+		case "CNAME":
+			if len(cnameRegion) > 0 {
+				powerDNSResult = append(powerDNSResult, cname)
 			}
 		case "ANY":
 			switch {
@@ -410,36 +420,25 @@ func handleSocketQuery(content io.Reader) (string, error) {
 				// we arbitrarily decide that the zone apex doesn't get to have A/AAAA
 
 				ns = append(ns, soa)
-				unmarshalledReply = PowerDNSResponse{
-					Result: ns,
+				powerDNSResult = ns
+			case len(cnameRegion) > 0:
+				powerDNSResult = append(powerDNSResult, cname)
+			default:
+				if len(v4IP) > 0 {
+					powerDNSResult = append(powerDNSResult, a)
 				}
-			case len(v4IP) > 0:
-				switch {
-				case len(v6IP) > 0:
-					unmarshalledReply = PowerDNSResponse{
-						Result: []PowerDNSResult{a, aaaa},
-					}
-				default:
-					unmarshalledReply = PowerDNSResponse{
-						Result: []PowerDNSResult{a},
-					}
-				}
-			case len(v6IP) > 0:
-				unmarshalledReply = PowerDNSResponse{
-					Result: []PowerDNSResult{aaaa},
+				if len(v6IP) > 0 {
+					powerDNSResult = append(powerDNSResult, aaaa)
 				}
 			}
+
 		case "SOA":
 			if slices.Contains(dnsZoneSlice, cleanQuery) {
-				unmarshalledReply = PowerDNSResponse{
-					Result: []PowerDNSResult{soa},
-				}
+				powerDNSResult = append(powerDNSResult, soa)
 			}
 		case "NS":
 			if slices.Contains(dnsZoneSlice, cleanQuery) {
-				unmarshalledReply = PowerDNSResponse{
-					Result: ns,
-				}
+				powerDNSResult = ns
 			}
 		case "TXT":
 			if qname == "netbox2dnsnetbox2dnsnetbox2dns" {
@@ -449,14 +448,15 @@ func handleSocketQuery(content io.Reader) (string, error) {
 					Content: "hello, txt",
 					TTL:     42,
 				}
-
-				unmarshalledReply = PowerDNSResponse{
-					Result: []PowerDNSResult{txt},
-				}
+				powerDNSResult = append(powerDNSResult, txt)
 			}
 		default:
 			log.Println("Ignoring unsupported qtype " + query.Parameters.Qtype)
 			return `{"result":false}`, nil
+		}
+
+		unmarshalledReply = PowerDNSResponse{
+			Result: powerDNSResult,
 		}
 
 	// TODO axfr
@@ -563,17 +563,17 @@ func main() {
 	transport := &http.Transport{TLSClientConfig: config}
 	client = &http.Client{Transport: transport}
 
-	for _, v := range []*string{pdnsSocket, netboxURL, netboxToken, dnsZone, soaContact, zoneServers} {
+	for _, v := range []*string{pdnsSocket, netboxURL, netboxToken, soaContact, zoneServers, baseDomain} {
 		if len(*v) == 0 {
 			log.Fatalln("ERROR: missing flag")
 		}
 	}
-	dnsZoneSlice = strings.Split(*dnsZone, ",")
 	zoneServersSlice = strings.Split(*zoneServers, ",")
 
 	// fetch initial inventory of hostnames and IPs
 	startTime := time.Now()
 	for _, v := range initNetboxRegions() {
+		dnsZoneSlice = append(dnsZoneSlice, v+"."+*baseDomain)
 		replyMapv4[v] = make(map[string]string)
 		replyMapv6[v] = make(map[string]string)
 		if *debugSkipSync {
@@ -584,6 +584,7 @@ func main() {
 		}
 		paginationOffset = 0
 	}
+	dnsZoneSlice = append(dnsZoneSlice, *baseDomain)
 	replyMapv4["vm"] = make(map[string]string)
 	replyMapv6["vm"] = make(map[string]string)
 	if *debugSkipSync {
